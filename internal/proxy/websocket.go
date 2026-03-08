@@ -68,16 +68,25 @@ type wsRelayStats struct {
 // handleWebSocket handles /ws WebSocket proxy requests.
 func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	cfg := p.cfgPtr.Load()
-	sc := p.scannerPtr.Load()
+
+	clientIP, requestID := requestMeta(r)
+
+	// Resolve per-agent config and scanner from a single registry snapshot.
+	// This prevents TOCTOU races during hot-reload where knownProfiles()
+	// and resolveAgent() could read different registries.
+	resolved, id := p.resolveAgentFromRequest(r)
+	cfg := resolved.Config
+	sc := resolved.Scanner
+	agent := id.Name
+	if agent == "" {
+		agent = agentAnonymous
+	}
 
 	if !cfg.WebSocketProxy.Enabled {
 		http.Error(w, "WebSocket proxy not enabled", http.StatusNotFound)
 		return
 	}
 
-	clientIP, requestID := requestMeta(r)
-	agent := ExtractAgent(r)
 	log := p.logger.With("agent", agent)
 
 	// Extract and validate target URL. Uses the same extraction logic as /fetch
@@ -112,7 +121,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	if !result.Allowed {
 		if cfg.EnforceEnabled() {
-			log.LogBlocked("WS", targetURL, result.Scanner, result.Reason, clientIP, requestID)
+			log.LogBlocked("WS", targetURL, result.Scanner, result.Reason, clientIP, requestID, agent)
 			p.metrics.RecordWSBlocked()
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
@@ -121,11 +130,19 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.LogAnomaly("WS", targetURL, result.Scanner,
-			result.Reason, clientIP, requestID, result.Score)
+			result.Reason, clientIP, requestID, agent, result.Score)
 	}
 
 	if sessionBlocked {
 		http.Error(w, sessionDetail, http.StatusForbidden)
+		return
+	}
+
+	// Budget admission check: enforce request count and domain limits.
+	if exceeded, reason := resolved.Budget.CheckAdmission(strings.ToLower(parsed.Hostname())); exceeded {
+		log.LogBlocked("WS", targetURL, "budget", reason, clientIP, requestID, agent)
+		p.metrics.RecordWSBlocked()
+		http.Error(w, "WebSocket blocked: "+reason, http.StatusTooManyRequests)
 		return
 	}
 
@@ -156,7 +173,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	clientConn, _, _, upgradeErr := upgrader.Upgrade(r, w)
 	if upgradeErr != nil {
-		log.LogError("WS", targetURL, clientIP, requestID, fmt.Errorf("client upgrade: %w", upgradeErr))
+		log.LogError("WS", targetURL, clientIP, requestID, agent, fmt.Errorf("client upgrade: %w", upgradeErr))
 		// If Upgrade fails, it already wrote the HTTP error response.
 		return
 	}
@@ -165,7 +182,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Dial upstream via SSRF-safe dialer.
 	upstreamConn, dialErr := p.wsDialUpstream(r.Context(), targetURL, fwdHeaders, cfg)
 	if dialErr != nil {
-		log.LogError("WS", targetURL, clientIP, requestID, fmt.Errorf("upstream dial: %w", dialErr))
+		log.LogError("WS", targetURL, clientIP, requestID, agent, fmt.Errorf("upstream dial: %w", dialErr))
 		plwsutil.WriteCloseFrame(clientConn, ws.StatusInternalServerError, "upstream dial failed")
 		return
 	}
@@ -207,6 +224,11 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		stats.textFrames, stats.binaryFrames, duration)
 
 	sc.RecordRequest(relay.hostname, int(stats.clientToServer+stats.serverToClient))
+
+	// Record WebSocket bytes for per-agent budget tracking. WebSocket
+	// connections are streaming: bytes are tracked after close and enforced
+	// on the next admission check, not mid-stream.
+	resolved.Budget.RecordBytes(stats.clientToServer + stats.serverToClient)
 }
 
 // buildWSForwardHeaders builds the HTTP headers to forward during upstream WS handshake.

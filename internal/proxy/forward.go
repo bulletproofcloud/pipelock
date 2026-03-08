@@ -77,11 +77,20 @@ func getTunnelSemaphore() *tunnelSemaphore {
 // via the SSRF-safe dialer, and relays data bidirectionally.
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	cfg := p.cfgPtr.Load()
-	sc := p.scannerPtr.Load()
 
 	clientIP, requestID := requestMeta(r)
-	agent := ExtractAgent(r)
+
+	// Resolve per-agent config and scanner from a single registry snapshot.
+	// This prevents TOCTOU races during hot-reload where knownProfiles()
+	// and resolveAgent() could read different registries.
+	resolved, id := p.resolveAgentFromRequest(r)
+	cfg := resolved.Config
+	sc := resolved.Scanner
+	agent := id.Name
+	if agent == "" {
+		agent = agentAnonymous
+	}
+	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 
 	target := r.Host
 	if target == "" {
@@ -115,8 +124,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if !result.Allowed {
 		if cfg.EnforceEnabled() {
-			p.logger.LogBlocked(http.MethodConnect, target, result.Scanner, result.Reason, clientIP, requestID)
-			p.metrics.RecordTunnelBlocked()
+			p.logger.LogBlocked(http.MethodConnect, target, result.Scanner, result.Reason, clientIP, requestID, agent)
+			p.metrics.RecordTunnelBlocked(agentLabel)
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
@@ -125,11 +134,19 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		// Audit mode: log anomaly but allow through
 		p.logger.LogAnomaly(http.MethodConnect, target, result.Scanner,
-			result.Reason, clientIP, requestID, result.Score)
+			result.Reason, clientIP, requestID, agent, result.Score)
 	}
 
 	if sessionBlocked {
 		http.Error(w, sessionDetail, http.StatusForbidden)
+		return
+	}
+
+	// Budget admission check: enforce request count and domain limits.
+	if exceeded, reason := resolved.Budget.CheckAdmission(strings.ToLower(host)); exceeded {
+		p.logger.LogBlocked(http.MethodConnect, target, "budget", reason, clientIP, requestID, agent)
+		p.metrics.RecordTunnelBlocked(agentLabel)
+		http.Error(w, "CONNECT blocked: "+reason, http.StatusTooManyRequests)
 		return
 	}
 
@@ -141,7 +158,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordWSRedirectHint()
 			p.logger.LogAnomaly(http.MethodConnect, target, "",
 				fmt.Sprintf("hint: %s supports WebSocket; consider using /ws endpoint for frame-level scanning", host),
-				clientIP, requestID, 0.2)
+				clientIP, requestID, agent, 0.2)
 		}
 	}
 
@@ -162,7 +179,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	targetConn, err := p.ssrfSafeDialContext(dialCtx, "tcp", target)
 	if err != nil {
-		p.logger.LogError(http.MethodConnect, target, clientIP, requestID, err)
+		p.logger.LogError(http.MethodConnect, target, clientIP, requestID, agent, err)
 		http.Error(w, "tunnel dial failed", http.StatusBadGateway)
 		return
 	}
@@ -175,7 +192,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		p.logger.LogError(http.MethodConnect, target, clientIP, requestID,
+		p.logger.LogError(http.MethodConnect, target, clientIP, requestID, agent,
 			fmt.Errorf("response writer does not support hijacking"))
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
@@ -183,7 +200,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, buf, err := hijacker.Hijack()
 	if err != nil {
-		p.logger.LogError(http.MethodConnect, target, clientIP, requestID, err)
+		p.logger.LogError(http.MethodConnect, target, clientIP, requestID, agent, err)
 		return
 	}
 	defer clientConn.Close() //nolint:errcheck // best effort
@@ -199,9 +216,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if cfg.ForwardProxy.SNIVerificationEnabled() {
 		resized, sniHost, category, sniErr := verifySNI(clientReader, clientConn, host, sniReadTimeoutDefault)
 		clientReader = resized
-		p.metrics.RecordSNI(category)
+		p.metrics.RecordSNI(category, agentLabel)
 		if sniErr != nil {
-			p.logger.LogSNIMismatch(host, sniHost, clientIP, requestID, category)
+			p.logger.LogSNIMismatch(host, sniHost, clientIP, requestID, agent, category)
 			return // close both connections via deferred Close()
 		}
 	}
@@ -216,7 +233,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if certCache == nil {
 			// Fail-closed: TLS interception is enabled but cert cache is missing.
 			// Connection is already hijacked, so close both sides (deferred).
-			p.logger.LogError(http.MethodConnect, host, clientIP, requestID, fmt.Errorf("TLS interception enabled but cert cache unavailable"))
+			p.logger.LogError(http.MethodConnect, host, clientIP, requestID, agent, fmt.Errorf("TLS interception enabled but cert cache unavailable"))
 			p.metrics.RecordTLSIntercept("failed")
 			return
 		}
@@ -225,14 +242,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = targetConn.Close()
 		targetConn = nil
 		p.metrics.RecordTLSIntercept("intercepted")
-		p.logger.LogAnomaly(http.MethodConnect, host, "tls_intercept", "TLS MITM interception active", clientIP, requestID, 0) // 0: informational, not anomalous
+		p.logger.LogAnomaly(http.MethodConnect, host, "tls_intercept", "TLS MITM interception active", clientIP, requestID, agent, 0) // 0: informational, not anomalous
 		// Wrap clientConn with buffered reader so any bytes peeked during
 		// SNI verification (ClientHello) are available to the TLS server.
 		interceptConn := wrapBuffered(clientConn, clientReader)
 		interceptCtx, interceptCancel := context.WithDeadline(r.Context(), deadline)
 		defer interceptCancel()
-		if err := interceptTunnel(interceptCtx, interceptConn, host, port, cfg, sc, certCache, p.logger, p.metrics, clientIP, requestID, p.tlsTransport, p.ssrfSafeDialContext); err != nil {
-			p.logger.LogError(http.MethodConnect, host, clientIP, requestID, err)
+		if err := interceptTunnel(interceptCtx, interceptConn, host, port, cfg, sc, certCache, p.logger, p.metrics, clientIP, requestID, agent, p.tlsTransport, p.ssrfSafeDialContext); err != nil {
+			p.logger.LogError(http.MethodConnect, host, clientIP, requestID, agent, err)
 		}
 		return
 	}
@@ -245,7 +262,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.metrics.IncrActiveTunnels()
-	p.logger.LogTunnelOpen(target, clientIP, requestID)
+	p.logger.LogTunnelOpen(target, clientIP, requestID, agent)
 
 	// Bidirectional relay with idle timeout
 	idleTimeout := time.Duration(cfg.ForwardProxy.IdleTimeoutSeconds) * time.Second
@@ -253,11 +270,16 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	p.metrics.DecrActiveTunnels()
 	duration := time.Since(start)
-	p.metrics.RecordTunnel(duration, totalBytes)
-	p.logger.LogTunnelClose(target, clientIP, requestID, totalBytes, duration)
+	p.metrics.RecordTunnel(duration, totalBytes, agentLabel)
+	p.logger.LogTunnelClose(target, clientIP, requestID, agent, totalBytes, duration)
 
 	// Record data budget for the target domain
 	sc.RecordRequest(strings.ToLower(host), int(totalBytes))
+
+	// Record tunnel bytes for per-agent budget tracking. CONNECT tunnels
+	// are streaming: bytes are tracked after close and enforced on the next
+	// admission check, not mid-stream (can't un-send tunnel data).
+	resolved.Budget.RecordBytes(totalBytes)
 }
 
 // bidirectionalCopy relays data between two connections with idle timeout.
@@ -322,11 +344,20 @@ func copyWithIdleTimeout(dst, src net.Conn, idleTimeout time.Duration, deadline 
 // request, and streams the raw response back to the client.
 func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	cfg := p.cfgPtr.Load()
-	sc := p.scannerPtr.Load()
 
 	clientIP, requestID := requestMeta(r)
-	agent := ExtractAgent(r)
+
+	// Resolve per-agent config and scanner from a single registry snapshot.
+	// This prevents TOCTOU races during hot-reload where knownProfiles()
+	// and resolveAgent() could read different registries.
+	resolved, id := p.resolveAgentFromRequest(r)
+	cfg := resolved.Config
+	sc := resolved.Scanner
+	agent := id.Name
+	if agent == "" {
+		agent = agentAnonymous
+	}
+	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 
 	targetURL := r.URL.String()
 
@@ -339,8 +370,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !result.Allowed {
 		if cfg.EnforceEnabled() {
-			p.logger.LogBlocked(r.Method, targetURL, result.Scanner, result.Reason, clientIP, requestID)
-			p.metrics.RecordBlocked(r.URL.Hostname(), result.Scanner, time.Since(start))
+			p.logger.LogBlocked(r.Method, targetURL, result.Scanner, result.Reason, clientIP, requestID, agent)
+			p.metrics.RecordBlocked(r.URL.Hostname(), result.Scanner, time.Since(start), agentLabel)
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
@@ -348,11 +379,19 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.logger.LogAnomaly(r.Method, targetURL, result.Scanner,
-			result.Reason, clientIP, requestID, result.Score)
+			result.Reason, clientIP, requestID, agent, result.Score)
 	}
 
 	if sessionBlocked {
 		http.Error(w, sessionDetail, http.StatusForbidden)
+		return
+	}
+
+	// Budget admission check: enforce request count and domain limits.
+	if exceeded, reason := resolved.Budget.CheckAdmission(strings.ToLower(r.URL.Hostname())); exceeded {
+		p.logger.LogBlocked(r.Method, targetURL, "budget", reason, clientIP, requestID, agent)
+		p.metrics.RecordBlocked(r.URL.Hostname(), "budget", time.Since(start), agentLabel)
+		http.Error(w, "blocked: "+reason, http.StatusTooManyRequests)
 		return
 	}
 
@@ -373,21 +412,21 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				reason = fmt.Sprintf("request body contains secret: %s", strings.Join(patternNames, ", "))
 			}
 
-			p.logger.LogBodyDLP(r.Method, targetURL, action, clientIP, requestID, len(bodyResult.DLPMatches), patternNames)
-			p.metrics.RecordBodyDLP(action)
+			p.logger.LogBodyDLP(r.Method, targetURL, action, clientIP, requestID, agent, len(bodyResult.DLPMatches), patternNames)
+			p.metrics.RecordBodyDLP(action, agentLabel)
 
 			// Fail-closed: when buf is nil the body was consumed but couldn't
 			// be buffered (oversize, compressed, read error, multipart parse
 			// error). Always block regardless of enforce mode — forwarding an
 			// empty body corrupts the upstream request.
 			if buf == nil {
-				p.metrics.RecordBlocked(r.URL.Hostname(), "body_dlp", time.Since(start))
+				p.metrics.RecordBlocked(r.URL.Hostname(), "body_dlp", time.Since(start), agentLabel)
 				http.Error(w, "blocked: "+reason, http.StatusForbidden)
 				return
 			}
 
 			if action == config.ActionBlock && cfg.EnforceEnabled() {
-				p.metrics.RecordBlocked(r.URL.Hostname(), "body_dlp", time.Since(start))
+				p.metrics.RecordBlocked(r.URL.Hostname(), "body_dlp", time.Since(start), agentLabel)
 				http.Error(w, "blocked: "+reason, http.StatusForbidden)
 				return
 			}
@@ -399,21 +438,26 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Request header DLP scanning.
-	if p.evalHeaderDLP(r.Header, cfg, sc, p.logger, r.Method, targetURL, r.URL.Hostname(), clientIP, requestID, start) {
+	if p.evalHeaderDLP(r.Header, cfg, sc, p.logger, r.Method, targetURL, r.URL.Hostname(), clientIP, requestID, agent, start) {
 		http.Error(w, "blocked: request header contains secret", http.StatusForbidden)
 		return
 	}
 
-	// Clone request with context keys so CheckRedirect can attribute audit logs
+	// Clone request with context keys so CheckRedirect uses the per-agent
+	// config/scanner for redirect enforcement, not the global default.
 	ctx := context.WithValue(r.Context(), ctxKeyClientIP, clientIP)
 	ctx = context.WithValue(ctx, ctxKeyRequestID, requestID)
+	ctx = context.WithValue(ctx, ctxKeyAgent, agent)
+	ctx = context.WithValue(ctx, ctxKeyAgentConfig, cfg)
+	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	outReq := r.Clone(ctx)
-	outReq.RequestURI = "" // required for http.Client
+	outReq.RequestURI = ""         // required for http.Client
+	outReq.Header.Del(AgentHeader) // strip internal identity header before upstream
 	removeHopByHopHeaders(outReq.Header)
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
-		p.logger.LogError(r.Method, targetURL, clientIP, requestID, err)
+		p.logger.LogError(r.Method, targetURL, clientIP, requestID, agent, err)
 		http.Error(w, "forward proxy fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -437,16 +481,34 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream body with size limit
+	// Stream body with size limit. Cap at the tighter of max_response_mb
+	// and remaining byte budget so forward-proxy responses are truncated
+	// when the per-agent byte budget is exhausted.
 	maxBytes := int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
+	budgetRemaining := resolved.Budget.RemainingBytes()
+	if budgetRemaining >= 0 && budgetRemaining < maxBytes {
+		maxBytes = budgetRemaining
+	}
 	written, _ := io.Copy(w, io.LimitReader(resp.Body, maxBytes))
 
 	// Record data budget for the target domain
 	sc.RecordRequest(strings.ToLower(r.URL.Hostname()), int(written))
 
+	// Record bytes for per-agent budget tracking.
+	resolved.Budget.RecordBytes(written)
+
+	// Detect truncated response due to budget exhaustion. If budget was the
+	// effective limit and all available bytes were consumed, the response was
+	// likely truncated. Log as budget exhaustion instead of normal success.
+	if budgetRemaining >= 0 && written >= budgetRemaining {
+		reason := fmt.Sprintf("response truncated at byte budget: %d bytes written", written)
+		p.logger.LogAnomaly(r.Method, targetURL, "budget_truncated", reason, clientIP, requestID, agent, 0)
+		return
+	}
+
 	duration := time.Since(start)
-	p.metrics.RecordAllowed(duration)
-	p.logger.LogForwardHTTP(r.Method, targetURL, clientIP, requestID, resp.StatusCode, int(written), duration)
+	p.metrics.RecordAllowed(duration, agentLabel)
+	p.logger.LogForwardHTTP(r.Method, targetURL, clientIP, requestID, agent, resp.StatusCode, int(written), duration)
 }
 
 // dlpMatchNames extracts pattern names from a slice of DLP matches.

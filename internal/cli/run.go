@@ -163,7 +163,10 @@ Examples:
 			} else {
 				ks.SetSeparateAPIPort(true)
 			}
-			p := proxy.New(cfg, logger, sc, m, proxyOpts...)
+			p, pErr := proxy.New(cfg, logger, sc, m, proxyOpts...)
+			if pErr != nil {
+				return fmt.Errorf("creating proxy: %w", pErr)
+			}
 
 			// Load TLS interception CA if configured.
 			if err := p.LoadCertCache(cfg); err != nil {
@@ -190,7 +193,7 @@ Examples:
 
 				go func() {
 					if err := reloader.Start(ctx); err != nil {
-						logger.LogError("CONFIG_RELOAD", configFile, "", "", err)
+						logger.LogError("CONFIG_RELOAD", configFile, "", "", "", err)
 					}
 				}()
 
@@ -199,7 +202,7 @@ Examples:
 						func() {
 							defer func() {
 								if r := recover(); r != nil {
-									logger.LogError("CONFIG_RELOAD", configFile, "", "",
+									logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 										fmt.Errorf("scanner construction panic: %v", r))
 								}
 							}()
@@ -212,7 +215,7 @@ Examples:
 								}
 								// Block downgrades from strict mode (security-critical).
 								if oldCfg.Mode == config.ModeStrict && len(warnings) > 0 {
-									logger.LogError("CONFIG_RELOAD", configFile, "", "",
+									logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 										fmt.Errorf("rejected: security downgrade from strict mode"))
 									return
 								}
@@ -220,14 +223,14 @@ Examples:
 								// set at server start and cannot change at runtime; tunnels
 								// would be killed prematurely. Restart to enable.
 								if !oldCfg.ForwardProxy.Enabled && newCfg.ForwardProxy.Enabled {
-									logger.LogError("CONFIG_RELOAD", configFile, "", "",
+									logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 										fmt.Errorf("rejected: forward proxy cannot be enabled via reload (requires restart)"))
 									return
 								}
 								// Block enabling WebSocket proxy via reload for the same
 								// reason: WriteTimeout must be 0 at server start.
 								if !oldCfg.WebSocketProxy.Enabled && newCfg.WebSocketProxy.Enabled {
-									logger.LogError("CONFIG_RELOAD", configFile, "", "",
+									logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 										fmt.Errorf("rejected: WebSocket proxy cannot be enabled via reload (requires restart)"))
 									return
 								}
@@ -249,7 +252,7 @@ Examples:
 							newSc := scanner.New(newCfg)
 							p.Reload(newCfg, newSc)
 							if reloadErr := p.LoadCertCache(newCfg); reloadErr != nil {
-								logger.LogError("CONFIG_RELOAD", configFile, "", "",
+								logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 									fmt.Errorf("TLS cert cache reload failed: %w", reloadErr))
 							}
 							ks.Reload(newCfg)
@@ -258,13 +261,13 @@ Examples:
 							// swap into emitter, close old sinks.
 							newSinks, sinkErr := buildEmitSinks(newCfg)
 							if sinkErr != nil {
-								logger.LogError("CONFIG_RELOAD", configFile, "", "",
+								logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 									fmt.Errorf("emit sink rebuild failed: %w", sinkErr))
 							} else {
 								oldSinks := emitter.ReloadSinks(newSinks)
 								for _, s := range oldSinks {
 									if closeErr := s.Close(); closeErr != nil {
-										logger.LogError("CONFIG_RELOAD", configFile, "", "",
+										logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
 											fmt.Errorf("closing old emit sink: %w", closeErr))
 									}
 								}
@@ -318,6 +321,11 @@ Examples:
 			}
 			if hasMCPListen {
 				cmd.PrintErrf("  MCP:    http://%s -> %s\n", mcpListen, mcpUpstream)
+			}
+			for name, profile := range cfg.Agents {
+				for _, addr := range profile.Listeners {
+					cmd.PrintErrf("  Agent:  %s -> http://%s\n", name, addr)
+				}
 			}
 
 			// Check for agent command after --
@@ -469,9 +477,68 @@ Examples:
 				}()
 			}
 
+			// Bind per-agent listener servers. Each listener injects the
+			// agent profile via context so identity is port-based, not
+			// header-based (spoof-proof).
+			var agentListenerCount int
+			var agentListenerErrs chan error
+			if len(cfg.Agents) > 0 {
+				// Count total listeners to size the error channel.
+				for _, profile := range cfg.Agents {
+					agentListenerCount += len(profile.Listeners)
+				}
+			}
+			if agentListenerCount > 0 {
+				handler := p.Handler()
+				agentListenerErrs = make(chan error, agentListenerCount)
+
+				// Agent listeners use the same WriteTimeout logic as the main
+				// server: disabled when forward proxy or WebSocket proxy is
+				// enabled (CONNECT tunnels and /ws sessions are long-lived).
+				agentWriteTimeout := time.Duration(cfg.FetchProxy.TimeoutSeconds+10) * time.Second
+				if cfg.ForwardProxy.Enabled || cfg.WebSocketProxy.Enabled {
+					agentWriteTimeout = 0
+				}
+
+				for name, profile := range cfg.Agents {
+					for _, addr := range profile.Listeners {
+						ln, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+						if lnErr != nil {
+							return fmt.Errorf("agent %q listener bind %s: %w", name, addr, lnErr)
+						}
+						srv := &http.Server{
+							Handler:           agentHandler(name, handler),
+							ReadTimeout:       10 * time.Second,
+							ReadHeaderTimeout: 5 * time.Second,
+							WriteTimeout:      agentWriteTimeout,
+							IdleTimeout:       120 * time.Second, // matches main server idle timeout
+						}
+						// Register with proxy so its shutdown goroutine
+						// gracefully stops agent servers alongside the main server.
+						p.RegisterAgentServer(srv)
+						errCh := agentListenerErrs
+						go func(s *http.Server, listener net.Listener) {
+							srvErr := s.Serve(listener)
+							if errors.Is(srvErr, http.ErrServerClosed) {
+								srvErr = nil
+							}
+							errCh <- srvErr
+						}(srv, ln)
+						cmd.PrintErrf("pipelock: agent %q listening on %s\n", name, addr)
+					}
+				}
+			}
+
 			// Start the fetch proxy (blocks until context cancelled or error).
 			if err := p.Start(ctx); err != nil {
 				return fmt.Errorf("proxy error: %w", err)
+			}
+
+			// If agent listeners were running, drain their error channels.
+			for range agentListenerCount {
+				if aErr := <-agentListenerErrs; aErr != nil {
+					cmd.PrintErrf("pipelock: agent listener error: %v\n", aErr)
+				}
 			}
 
 			// If MCP listener was running, check for errors.
@@ -561,4 +628,14 @@ func redactEndpoint(raw string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String()
+}
+
+// agentHandler wraps a proxy handler with a context-injected agent profile.
+// Requests through this handler are identified by the bound port, not by
+// the X-Pipelock-Agent header, making them spoof-proof.
+func agentHandler(profile string, handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := proxy.WithAgentOverride(r.Context(), profile)
+		handler.ServeHTTP(w, r.WithContext(ctx))
+	})
 }

@@ -758,6 +758,170 @@ What it enables beyond `strict`:
 
 The core principle: the model won't protect you, so the network layer must.
 
+## Agent Profiles
+
+Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`, `volume_spike_ratio`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+
+```yaml
+agents:
+  claude-code:
+    listeners: [":8889"]
+    source_cidrs: ["10.42.3.0/24"]
+    mode: strict
+    api_allowlist: ["github.com", "*.githubusercontent.com"]
+    dlp:
+      include_defaults: true
+      patterns:
+        - name: "Internal Token"
+          regex: 'internal_[a-zA-Z0-9]{32}'
+          severity: critical
+    rate_limit:
+      max_requests_per_minute: 30
+    session_profiling:
+      domain_burst: 3
+      anomaly_action: block
+    mcp_tool_policy:
+      enabled: true
+      action: block
+      rules:
+        - name: "Block shell"
+          tool_pattern: "bash|shell"
+          action: block
+    budget:
+      max_requests_per_session: 500
+      max_bytes_per_session: 52428800
+      max_unique_domains_per_session: 50
+      window_minutes: 60
+
+  rook:
+    listeners: [":8890"]
+    mode: balanced
+    enforce: false
+    budget:
+      max_unique_domains_per_session: 200
+
+  _default:
+    mode: balanced
+```
+
+### Agent Resolution
+
+Pipelock resolves the agent name for each request using this priority order:
+
+1. **Listener binding**: matched by the port the request arrived on (injected as a context override, spoof-proof)
+2. **Source CIDRs**: matched by client IP against `source_cidrs` ranges defined on each agent profile
+3. **Header** (`X-Pipelock-Agent`): set by the calling agent or orchestrator
+4. **Query parameter** (`?agent=name`): appended to fetch/WebSocket URLs
+5. **Fallback**: `_default` profile if defined, otherwise base config
+
+Listener-based resolution is the only method that cannot be spoofed by the agent. It injects a context override that takes priority over header and query param. Header and query param methods are convenient but trust the caller. Use listeners when isolation matters.
+
+For MCP proxy mode, the `--agent` flag resolves the profile directly at startup (not through the HTTP resolution chain).
+
+### Override Fields
+
+Each agent profile can override these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `listeners` | `[]string` | Dedicated listen addresses (e.g., `":8889"`). Pipelock opens extra ports for these. |
+| `source_cidrs` | `[]string` | Client IP ranges that identify this agent (e.g., `["10.42.3.0/24"]`). |
+| `mode` | `string` | `strict`, `balanced`, or `audit` |
+| `enforce` | `bool` | Override global enforce setting |
+| `api_allowlist` | `[]string` | Replaces the base allowlist entirely |
+| `dlp` | object | DLP pattern overrides (see below) |
+| `rate_limit` | object | Per-agent rate limits |
+| `session_profiling` | object | Per-agent profiling thresholds |
+| `mcp_tool_policy` | object | Per-agent MCP tool policy |
+| `budget` | object | Request budgets (see below) |
+
+### DLP Merge Behavior
+
+Agent DLP overrides follow the same `include_defaults` pattern as the global DLP section:
+
+- `include_defaults: true` (or omitted): agent patterns are appended to the base config patterns. If an agent pattern shares a name with a base pattern, the agent version wins.
+- `include_defaults: false`: agent patterns replace the base patterns entirely.
+
+### Budget Config
+
+Budgets cap what an agent can do within a rolling time window. All fields default to `0` (unlimited).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_requests_per_session` | `int` | `0` | Max HTTP requests per window |
+| `max_bytes_per_session` | `int` | `0` | Max response bytes per window |
+| `max_unique_domains_per_session` | `int` | `0` | Max distinct domains per window |
+| `window_minutes` | `int` | `0` | Rolling window duration in minutes. `0` means the budget never resets. |
+
+When a budget limit is reached:
+
+- **Request count and domain limits** are checked before the outbound request. Exceeding either returns `429 Too Many Requests`.
+- **Byte limit (fetch proxy):** the response body read is capped at the remaining byte budget. If the response exceeds the limit, it is discarded and a `429` is returned.
+- **Byte limit (CONNECT/WebSocket):** streaming connections track bytes after close. The byte budget is enforced on the next admission check, not mid-stream, because tunnel data cannot be recalled after transmission.
+
+### Listener Binding
+
+Each agent can bind to one or more dedicated ports via the `listeners` field. Pipelock opens these ports at startup alongside the main proxy port. Requests arriving on an agent's listener are automatically resolved to that agent without relying on headers or query params.
+
+This is the only spoof-proof resolution method. The agent process connects to its assigned port, and pipelock knows which profile to apply based on the port alone.
+
+```yaml
+agents:
+  trusted-agent:
+    listeners: [":8889"]
+    mode: balanced
+  untrusted-agent:
+    listeners: [":8890"]
+    mode: strict
+    budget:
+      max_requests_per_session: 100
+```
+
+### Source CIDR Matching
+
+Each agent can define one or more `source_cidrs` entries. Pipelock matches the client IP of every incoming request against these CIDRs. This works for all traffic types including CONNECT tunnels, where header-based identification is not possible.
+
+In Kubernetes, each pod has a unique IP. In Docker Compose, each container has its own. Source CIDR matching maps those IPs to agent profiles with zero agent-side configuration.
+
+```yaml
+agents:
+  claude-code:
+    source_cidrs: ["10.42.3.0/24"]
+    mode: strict
+  cursor:
+    source_cidrs: ["10.42.5.0/24", "10.42.6.0/24"]
+    mode: balanced
+```
+
+Resolution priority: listener binding > source CIDR > header > query param > `_default`.
+
+CIDRs must not overlap between different agents (containment and exact matches are both rejected). Overlapping CIDRs within the same agent are allowed.
+
+### The `_default` Profile
+
+If defined, `_default` applies to any request that does not match a named agent. Without `_default`, unmatched requests use the base config directly.
+
+## License Key
+
+```yaml
+license_key: "pipelock_lic_v1_eyJ..."
+license_public_key: "a1b2c3d4..."  # hex-encoded Ed25519 public key
+```
+
+Multi-agent profiles (the `agents:` section) require a signed license token in `license_key`. The token is an Ed25519-signed JWT-like string issued by `pipelock license issue`. At startup, pipelock verifies the signature, checks expiration, and confirms the token includes the `agents` feature. If any check fails, agent profiles are disabled with a warning. All single-agent protection remains active.
+
+Official release builds embed the signing public key at compile time via ldflags. The embedded key takes priority over `license_public_key` and cannot be overridden by config, preventing self-signing bypasses. The `license_public_key` config field is only used in development builds where no key is embedded.
+
+Generate a keypair and issue licenses with:
+
+```bash
+pipelock license keygen              # generates ~/.config/pipelock/license.key + license.pub
+pipelock license issue --email customer@company.com --expires 2027-03-07
+pipelock license inspect TOKEN       # decode without verifying
+```
+
+A `_default` profile without any named agents does not require a license key.
+
 ## Validation Rules
 
 The following are enforced at startup:

@@ -42,6 +42,8 @@ const (
 	ctxKeyClientIP contextKey = iota
 	ctxKeyRequestID
 	ctxKeyAgent
+	ctxKeyAgentConfig  // per-agent resolved config for redirect scanning
+	ctxKeyAgentScanner // per-agent resolved scanner for redirect scanning
 )
 
 const (
@@ -107,6 +109,7 @@ var Version = "0.1.0-dev"
 type Proxy struct {
 	cfgPtr        atomic.Pointer[config.Config]
 	scannerPtr    atomic.Pointer[scanner.Scanner]
+	registryPtr   atomic.Pointer[AgentRegistry]
 	sessionMgrPtr atomic.Pointer[SessionManager]    // nil when profiling disabled
 	certCachePtr  atomic.Pointer[certgen.CertCache] // nil when TLS interception disabled
 	logger        *audit.Logger
@@ -117,6 +120,7 @@ type Proxy struct {
 	client        *http.Client
 	tlsTransport  *http.Transport // shared Transport for TLS interception upstream connections
 	server        *http.Server
+	agentServers  []*http.Server // per-agent listeners (managed by CLI)
 	startTime     time.Time
 	reloadMu      sync.Mutex // serializes Reload calls
 	approver      *hitl.Approver
@@ -155,7 +159,7 @@ type FetchResponse struct {
 }
 
 // New creates a new fetch proxy from config.
-func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metrics.Metrics, opts ...Option) *Proxy {
+func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metrics.Metrics, opts ...Option) (*Proxy, error) {
 	p := &Proxy{
 		logger:    logger,
 		metrics:   m,
@@ -166,6 +170,13 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	}
 	p.cfgPtr.Store(cfg)
 	p.scannerPtr.Store(sc)
+
+	// Build agent registry for per-agent config/scanner resolution.
+	reg, regErr := NewAgentRegistry(cfg)
+	if regErr != nil {
+		return nil, fmt.Errorf("agent registry: %w", regErr)
+	}
+	p.registryPtr.Store(reg)
 
 	if cfg.SessionProfiling.Enabled {
 		p.sessionMgrPtr.Store(NewSessionManager(&cfg.SessionProfiling, m))
@@ -196,21 +207,27 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			clientIP, _ := req.Context().Value(ctxKeyClientIP).(string)
 			requestID, _ := req.Context().Value(ctxKeyRequestID).(string)
 			agentName, _ := req.Context().Value(ctxKeyAgent).(string)
-			rlog := logger
-			if agentName != "" {
-				rlog = logger.With("agent", agentName)
+			logger.LogRedirect(originalURL, redirectURL, clientIP, requestID, agentName, len(via))
+			// Scan redirect URL with the per-agent scanner when available.
+			// Handlers attach the resolved agent config/scanner to the
+			// request context so redirect enforcement matches the agent
+			// profile, not the global default. Falls back to the global
+			// config/scanner for backward compatibility (pre-agent paths).
+			currentCfg, _ := req.Context().Value(ctxKeyAgentConfig).(*config.Config)
+			if currentCfg == nil {
+				currentCfg = p.cfgPtr.Load()
 			}
-			rlog.LogRedirect(originalURL, redirectURL, clientIP, requestID, len(via))
-			// Scan each redirect URL through the current scanner
-			currentCfg := p.cfgPtr.Load()
-			currentScanner := p.scannerPtr.Load()
+			currentScanner, _ := req.Context().Value(ctxKeyAgentScanner).(*scanner.Scanner)
+			if currentScanner == nil {
+				currentScanner = p.scannerPtr.Load()
+			}
 			result := currentScanner.Scan(redirectURL)
 			if !result.Allowed {
 				if currentCfg.EnforceEnabled() {
-					rlog.LogBlocked("GET", redirectURL, "redirect", fmt.Sprintf("redirect from %s blocked: %s", originalURL, result.Reason), clientIP, requestID)
+					logger.LogBlocked("GET", redirectURL, "redirect", fmt.Sprintf("redirect from %s blocked: %s", originalURL, result.Reason), clientIP, requestID, agentName)
 					return fmt.Errorf("redirect blocked: %s", result.Reason)
 				}
-				rlog.LogAnomaly("GET", redirectURL, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), clientIP, requestID, result.Score)
+				logger.LogAnomaly("GET", redirectURL, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), clientIP, requestID, agentName, result.Score)
 			}
 			return nil
 		},
@@ -218,7 +235,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 
 	p.tlsTransport = newTLSInterceptTransport(p.ssrfSafeDialContext, m.RecordTLSHandshake, nil)
 
-	return p
+	return p, nil
 }
 
 // CurrentConfig returns the currently active config. Used for reload comparison.
@@ -238,12 +255,25 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
 
+	// Build new agent registry BEFORE swapping config/scanner.
+	// If this fails, keep all existing state unchanged (fail-safe).
+	newReg, regErr := NewAgentRegistry(cfg)
+	if regErr != nil {
+		p.logger.LogError("RELOAD", "", "", "", "", fmt.Errorf("agent registry rebuild failed, keeping old config: %w", regErr))
+		sc.Close() // caller-allocated scanner must be closed since we're not using it
+		return
+	}
+
 	oldCfg := p.cfgPtr.Load()
 	p.cfgPtr.Store(cfg)
 	old := p.scannerPtr.Swap(sc)
 
 	if old != nil {
 		old.Close()
+	}
+
+	if oldReg := p.registryPtr.Swap(newReg); oldReg != nil {
+		oldReg.Close()
 	}
 
 	// Toggle session manager lifecycle on config change.
@@ -285,16 +315,113 @@ func (p *Proxy) LoadCertCache(cfg *config.Config) error {
 	return nil
 }
 
-// Close releases resources owned by the proxy (session manager goroutine).
-// Safe to call multiple times. Does not stop the HTTP server — use context
-// cancellation in Start() for that.
+// Close releases resources owned by the proxy (session manager goroutine,
+// agent registry scanners). Safe to call multiple times. Does not stop the
+// HTTP server — use context cancellation in Start() for that.
+// RegisterAgentServer adds an externally-managed agent server to the
+// proxy's shutdown list. Called by the CLI layer after binding agent
+// listeners, so Start()'s shutdown goroutine can gracefully stop them.
+func (p *Proxy) RegisterAgentServer(srv *http.Server) {
+	p.agentServers = append(p.agentServers, srv)
+}
+
 func (p *Proxy) Close() {
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
 		sm.Close()
 	}
+	if sc := p.scannerPtr.Load(); sc != nil {
+		sc.Close()
+	}
+	if reg := p.registryPtr.Load(); reg != nil {
+		reg.Close()
+	}
 	if p.tlsTransport != nil {
 		p.tlsTransport.CloseIdleConnections()
 	}
+}
+
+// resolveAgent returns the ResolvedAgent for the given profile name.
+// If the registry has not been initialized, falls back to the base config
+// and scanner stored on the proxy (backward-compatible default).
+func (p *Proxy) resolveAgent(profile string) *ResolvedAgent {
+	reg := p.registryPtr.Load()
+	if reg == nil {
+		return &ResolvedAgent{
+			Name:    profileDefault,
+			Config:  p.cfgPtr.Load(),
+			Scanner: p.scannerPtr.Load(),
+		}
+	}
+	return reg.Lookup(profile)
+}
+
+// knownProfiles returns a set of profile names from the current agent registry.
+// Used by ResolveAgent to determine whether a header-supplied agent name maps
+// to a configured profile (bounded cardinality) or falls back to _default.
+func (p *Proxy) knownProfiles() map[string]bool {
+	reg := p.registryPtr.Load()
+	if reg == nil {
+		return nil
+	}
+	profiles := reg.Profiles()
+	m := make(map[string]bool, len(profiles))
+	for _, name := range profiles {
+		m[name] = true
+	}
+	return m
+}
+
+// resolveAgentFromRequest resolves the agent identity and returns the
+// resolved agent from a single registry snapshot. This prevents TOCTOU
+// races during hot-reload where knownProfiles() and resolveAgent() could
+// read different registries.
+//
+// Resolution priority:
+//  1. Context override (listener binding, spoof-proof)
+//  2. Source CIDR match (client IP -> profile, zero agent-side config)
+//  3. Header / query param (X-Pipelock-Agent / ?agent=)
+//  4. Fallback (_default)
+func (p *Proxy) resolveAgentFromRequest(r *http.Request) (*ResolvedAgent, AgentIdentity) {
+	reg := p.registryPtr.Load()
+	if reg == nil {
+		return &ResolvedAgent{
+			Name:    profileDefault,
+			Config:  p.cfgPtr.Load(),
+			Scanner: p.scannerPtr.Load(),
+		}, AgentIdentity{Name: "", Profile: profileDefault}
+	}
+
+	// 1. Context override (set by per-agent listener binding).
+	if profile, ok := r.Context().Value(ctxKeyAgentOverride).(string); ok && profile != "" {
+		id := AgentIdentity{Name: profile, Profile: profile}
+		return reg.Lookup(id.Profile), id
+	}
+
+	// 2. Source CIDR match: map client IP to profile.
+	if clientIP := extractIP(r); clientIP != nil {
+		if profile, ok := reg.MatchCIDR(clientIP); ok {
+			id := AgentIdentity{Name: profile, Profile: profile}
+			return reg.Lookup(id.Profile), id
+		}
+	}
+
+	// 3+4. Header/query/fallback via ResolveAgent.
+	profiles := reg.Profiles()
+	known := make(map[string]bool, len(profiles))
+	for _, name := range profiles {
+		known[name] = true
+	}
+	id := ResolveAgent(r, known)
+	return reg.Lookup(id.Profile), id
+}
+
+// extractIP parses the client IP from r.RemoteAddr, stripping the port.
+func extractIP(r *http.Request) net.IP {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return net.ParseIP(host)
 }
 
 // newTLSInterceptTransport creates a shared http.Transport for TLS interception
@@ -552,6 +679,10 @@ func (p *Proxy) Start(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	// Agent listeners are managed by the CLI layer (run.go) which
+	// pre-binds ports for fail-fast error reporting. proxy.Start()
+	// only manages the main server lifecycle.
+
 	// Graceful shutdown on context cancellation.
 	// The done channel ensures this goroutine exits if ListenAndServe
 	// fails immediately (e.g., address already in use).
@@ -561,8 +692,13 @@ func (p *Proxy) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			for _, srv := range p.agentServers {
+				if shutErr := srv.Shutdown(shutdownCtx); shutErr != nil {
+					p.logger.LogError("SHUTDOWN", srv.Addr, "", "", "", shutErr)
+				}
+			}
 			if err := p.server.Shutdown(shutdownCtx); err != nil {
-				p.logger.LogError("SHUTDOWN", cfg.FetchProxy.Listen, "", "", err)
+				p.logger.LogError("SHUTDOWN", cfg.FetchProxy.Listen, "", "", "", err)
 			}
 			p.Close()
 		case <-done:
@@ -577,7 +713,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 			if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && !ip.IsLoopback()) {
 				p.logger.LogAnomaly("STARTUP", cfg.FetchProxy.Listen, "",
 					"listen address is not loopback — /metrics and /stats endpoints are exposed to the network",
-					"", "", 0.5)
+					"", "", "", 0.5)
 			}
 		}
 	}
@@ -595,11 +731,20 @@ func (p *Proxy) Start(ctx context.Context) error {
 // handleFetch processes URL fetch requests.
 func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	cfg := p.cfgPtr.Load()
-	sc := p.scannerPtr.Load()
 
 	clientIP, requestID := requestMeta(r)
-	agent := ExtractAgent(r)
+
+	// Resolve per-agent config and scanner from a single registry snapshot.
+	// This prevents TOCTOU races during hot-reload where knownProfiles()
+	// and resolveAgent() could read different registries.
+	resolved, id := p.resolveAgentFromRequest(r)
+	cfg := resolved.Config
+	sc := resolved.Scanner
+	agent := id.Name
+	if agent == "" {
+		agent = agentAnonymous
+	}
+	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 
 	// Create a per-request sub-logger tagged with the agent name
 	log := p.logger.With("agent", agent)
@@ -653,8 +798,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	if !result.Allowed {
 		if cfg.EnforceEnabled() {
-			log.LogBlocked("GET", displayURL, result.Scanner, result.Reason, clientIP, requestID)
-			p.metrics.RecordBlocked(parsed.Hostname(), result.Scanner, time.Since(start))
+			log.LogBlocked("GET", displayURL, result.Scanner, result.Reason, clientIP, requestID, agent)
+			p.metrics.RecordBlocked(parsed.Hostname(), result.Scanner, time.Since(start), agentLabel)
 			status := http.StatusForbidden
 			if result.Scanner == scanner.ScannerRateLimit {
 				status = http.StatusTooManyRequests
@@ -672,7 +817,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Audit mode: log anomaly but allow through
-		log.LogAnomaly("GET", displayURL, result.Scanner, result.Reason, clientIP, requestID, result.Score)
+		log.LogAnomaly("GET", displayURL, result.Scanner, result.Reason, clientIP, requestID, agent, result.Score)
 	}
 
 	if sessionBlocked {
@@ -686,7 +831,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Request header DLP scanning (fetch is GET-only, no body to scan).
-	if p.evalHeaderDLP(r.Header, cfg, sc, log, "GET", displayURL, parsed.Hostname(), clientIP, requestID, start) {
+	if p.evalHeaderDLP(r.Header, cfg, sc, log, "GET", displayURL, parsed.Hostname(), clientIP, requestID, agent, start) {
 		writeJSON(w, http.StatusForbidden, FetchResponse{
 			URL:         displayURL,
 			Agent:       agent,
@@ -696,13 +841,30 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch the URL — attach clientIP/requestID/agent to context for redirect logging
+	// Budget admission check: enforce request count and domain limits before
+	// making the outbound request. Byte budget is checked after the response.
+	if exceeded, reason := resolved.Budget.CheckAdmission(strings.ToLower(parsed.Hostname())); exceeded {
+		log.LogBlocked("GET", displayURL, "budget", reason, clientIP, requestID, agent)
+		p.metrics.RecordBlocked(parsed.Hostname(), "budget", time.Since(start), agentLabel)
+		writeJSON(w, http.StatusTooManyRequests, FetchResponse{
+			URL:         displayURL,
+			Agent:       agent,
+			Blocked:     true,
+			BlockReason: reason,
+		})
+		return
+	}
+
+	// Fetch the URL — attach clientIP/requestID/agent and resolved agent
+	// config/scanner to context for redirect logging and per-agent redirect enforcement.
 	ctx := context.WithValue(r.Context(), ctxKeyClientIP, clientIP)
 	ctx = context.WithValue(ctx, ctxKeyRequestID, requestID)
 	ctx = context.WithValue(ctx, ctxKeyAgent, agent)
+	ctx = context.WithValue(ctx, ctxKeyAgentConfig, cfg)
+	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		log.LogError("GET", displayURL, clientIP, requestID, err)
+		log.LogError("GET", displayURL, clientIP, requestID, agent, err)
 		writeJSON(w, http.StatusInternalServerError, FetchResponse{
 			URL:   displayURL,
 			Agent: agent,
@@ -719,8 +881,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		// Detect redirect blocks (from CheckRedirect) and report as blocked, not error.
 		if strings.Contains(err.Error(), "redirect blocked:") {
 			reason := err.Error()
-			log.LogBlocked("GET", displayURL, "redirect", reason, clientIP, requestID)
-			p.metrics.RecordBlocked(parsed.Hostname(), "redirect", time.Since(start))
+			log.LogBlocked("GET", displayURL, "redirect", reason, clientIP, requestID, agent)
+			p.metrics.RecordBlocked(parsed.Hostname(), "redirect", time.Since(start), agentLabel)
 			resp := FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -733,7 +895,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, resp)
 			return
 		}
-		log.LogError("GET", displayURL, clientIP, requestID, err)
+		log.LogError("GET", displayURL, clientIP, requestID, agent, err)
 		writeJSON(w, http.StatusBadGateway, FetchResponse{
 			URL:   displayURL,
 			Agent: agent,
@@ -743,15 +905,51 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close() //nolint:errcheck // response body
 
-	// Limit response body size
-	maxBytes := int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	// Limit response body size: use the tighter of max_response_mb and the
+	// remaining per-agent byte budget, so oversized responses are blocked
+	// at read time rather than after the full body has been consumed.
+	configMaxBytes := int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
+	maxBytes := configMaxBytes
+	remaining := resolved.Budget.RemainingBytes()
+	if remaining >= 0 && remaining < maxBytes {
+		maxBytes = remaining
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1)) // +1 to detect truncation
 	if err != nil {
-		log.LogError("GET", displayURL, clientIP, requestID, err)
+		log.LogError("GET", displayURL, clientIP, requestID, agent, err)
 		writeJSON(w, http.StatusBadGateway, FetchResponse{
 			URL:   displayURL,
 			Agent: agent,
 			Error: fmt.Sprintf("reading response: %v", err),
+		})
+		return
+	}
+	if int64(len(body)) > maxBytes {
+		// Determine which limit was the actual constraint.
+		if remaining < 0 || configMaxBytes <= remaining {
+			// Config max_response_mb was the limiter, not budget.
+			// Return 502 (response too large) without recording against budget.
+			reason := fmt.Sprintf("response size %d exceeds max_response_mb %d", len(body), configMaxBytes)
+			log.LogBlocked("GET", displayURL, "response_size", reason, clientIP, requestID, agent)
+			p.metrics.RecordBlocked(parsed.Hostname(), "response_size", time.Since(start), agentLabel)
+			writeJSON(w, http.StatusBadGateway, FetchResponse{
+				URL:         displayURL,
+				Agent:       agent,
+				Blocked:     true,
+				BlockReason: reason,
+			})
+			return
+		}
+		// Budget was the limiter: return 429.
+		reason := fmt.Sprintf("response size %d exceeds byte budget %d", len(body), maxBytes)
+		log.LogBlocked("GET", displayURL, "budget", reason, clientIP, requestID, agent)
+		p.metrics.RecordBlocked(parsed.Hostname(), "budget", time.Since(start), agentLabel)
+		resolved.Budget.RecordBytes(int64(len(body)))
+		writeJSON(w, http.StatusTooManyRequests, FetchResponse{
+			URL:         displayURL,
+			Agent:       agent,
+			Blocked:     true,
+			BlockReason: reason,
 		})
 		return
 	}
@@ -783,7 +981,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if isHTML {
 		article, err := readability.FromReader(strings.NewReader(content), parsed)
 		if err != nil {
-			log.LogAnomaly("GET", displayURL, "", fmt.Sprintf("readability extraction failed: %v", err), clientIP, requestID, 0.3)
+			log.LogAnomaly("GET", displayURL, "", fmt.Sprintf("readability extraction failed: %v", err), clientIP, requestID, agent, 0.3)
 		} else if article.TextContent != "" {
 			title = article.Title
 			content = article.TextContent
@@ -798,7 +996,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// concatenated fragments), so strip cannot function here.
 	if hiddenInjectionFound && !readabilityOK {
 		reason := "hidden injection detected and readability extraction failed (fail-closed)"
-		log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID)
+		log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID, agent)
+		p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
 		writeJSON(w, http.StatusForbidden, FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 		return
 	}
@@ -808,6 +1007,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		scanResult := sc.ScanResponse(content)
 		blocked, newContent, _ := p.filterAndActOnResponseScan(w, scanResult, content, displayURL, agent, clientIP, requestID, sc, cfg, log)
 		if blocked {
+			p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
 			return
 		}
 		content = newContent
@@ -816,9 +1016,14 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Record response size for per-domain data budget tracking
 	sc.RecordRequest(strings.ToLower(parsed.Hostname()), len(body))
 
+	// Record response bytes against the per-agent byte budget. Oversize
+	// responses are already blocked during the read phase above, so this
+	// records the actual bytes consumed for successful responses.
+	resolved.Budget.RecordBytes(int64(len(body)))
+
 	duration := time.Since(start)
-	p.metrics.RecordAllowed(duration)
-	log.LogAllowed("GET", displayURL, clientIP, requestID, resp.StatusCode, len(body), duration)
+	p.metrics.RecordAllowed(duration, agentLabel)
+	log.LogAllowed("GET", displayURL, clientIP, requestID, resp.StatusCode, len(body), duration, agent)
 
 	writeJSON(w, http.StatusOK, FetchResponse{
 		URL:         displayURL,
@@ -868,13 +1073,13 @@ func (p *Proxy) filterAndActOnResponseScan(
 	switch sc.ResponseAction() {
 	case config.ActionBlock:
 		reason := fmt.Sprintf("response contains prompt injection: %s", strings.Join(patternNames, ", "))
-		log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID)
+		log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID, agent)
 		writeJSON(w, http.StatusForbidden, FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 		return true, "", true
 	case config.ActionAsk:
 		if p.approver == nil {
 			reason := fmt.Sprintf("response contains prompt injection: %s (no HITL approver)", strings.Join(patternNames, ", "))
-			log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID)
+			log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID, agent)
 			writeJSON(w, http.StatusForbidden, FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 			return true, "", true
 		}
@@ -891,23 +1096,23 @@ func (p *Proxy) filterAndActOnResponseScan(
 		})
 		switch d {
 		case hitl.DecisionAllow:
-			log.LogResponseScan(displayURL, clientIP, requestID, "ask:allow", len(result.Matches), patternNames)
+			log.LogResponseScan(displayURL, clientIP, requestID, agent, "ask:allow", len(result.Matches), patternNames)
 		case hitl.DecisionStrip:
 			out = result.TransformedContent
-			log.LogResponseScan(displayURL, clientIP, requestID, "ask:strip", len(result.Matches), patternNames)
+			log.LogResponseScan(displayURL, clientIP, requestID, agent, "ask:strip", len(result.Matches), patternNames)
 		default:
 			reason := fmt.Sprintf("response blocked by operator: %s", strings.Join(patternNames, ", "))
-			log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID)
+			log.LogBlocked("GET", displayURL, "response_scan", reason, clientIP, requestID, agent)
 			writeJSON(w, http.StatusForbidden, FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 			return true, "", true
 		}
 	case config.ActionStrip:
 		out = result.TransformedContent
-		log.LogResponseScan(displayURL, clientIP, requestID, config.ActionStrip, len(result.Matches), patternNames)
+		log.LogResponseScan(displayURL, clientIP, requestID, agent, config.ActionStrip, len(result.Matches), patternNames)
 	case config.ActionWarn:
-		log.LogResponseScan(displayURL, clientIP, requestID, config.ActionWarn, len(result.Matches), patternNames)
+		log.LogResponseScan(displayURL, clientIP, requestID, agent, config.ActionWarn, len(result.Matches), patternNames)
 	default:
-		log.LogResponseScan(displayURL, clientIP, requestID, sc.ResponseAction(), len(result.Matches), patternNames)
+		log.LogResponseScan(displayURL, clientIP, requestID, agent, sc.ResponseAction(), len(result.Matches), patternNames)
 	}
 	return false, out, true
 }

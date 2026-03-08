@@ -166,9 +166,15 @@ curl http://localhost:8888/stats | jq .
     "anomalies": 0,
     "escalations": 0,
     "top_anomalies": []
+  },
+  "agents": {
+    "claude-code": {"allowed": 35, "blocked": 1, "tunnels": 1200},
+    "cursor": {"allowed": 5, "blocked": 1, "tunnels": 323}
   }
 }
 ```
+
+The `agents` field is omitted when no agent-scoped traffic has been recorded. Fresh deployments or single-profile setups without agent configuration will not include this key.
 
 ## Grafana Dashboard
 

@@ -50,7 +50,10 @@ func setupForwardProxy(t *testing.T, cfgMod func(*config.Config)) (string, func(
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
 	m := metrics.New()
-	p := New(cfg, logger, sc, m)
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	lc := net.ListenConfig{}
 	ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
@@ -86,7 +89,10 @@ func setupForwardProxy(t *testing.T, cfgMod func(*config.Config)) (string, func(
 	}()
 
 	proxyAddr := ln.Addr().String()
-	return proxyAddr, cancel
+	return proxyAddr, func() {
+		cancel()
+		sc.Close()
+	}
 }
 
 // dialProxy connects to the proxy via TCP.
@@ -511,6 +517,41 @@ func TestForwardHTTPHopByHop(t *testing.T) {
 	}
 }
 
+func TestForwardHTTPAgentHeaderStripped(t *testing.T) {
+	// X-Pipelock-Agent is an internal identity header. It must be stripped
+	// before forwarding to the upstream server to prevent information leakage.
+	backend := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.Header.Get(AgentHeader); v != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, "agent header leaked: %s", v)
+			return
+		}
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer backend.Close()
+
+	proxyAddr, cleanup := setupForwardProxy(t, nil)
+	defer cleanup()
+
+	conn := dialProxy(t, proxyAddr)
+	defer func() { _ = conn.Close() }()
+
+	reqStr := fmt.Sprintf("GET %s/leak-test HTTP/1.1\r\nHost: %s\r\n%s: my-agent\r\n\r\n",
+		backend.URL, backend.Listener.Addr().String(), AgentHeader)
+	_, _ = conn.Write([]byte(reqStr))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("agent header leaked to upstream: %s", body)
+	}
+}
+
 func TestForwardHTTPContentLengthStripped(t *testing.T) {
 	// Verify the proxy strips upstream Content-Length before writing the
 	// response. Go's ResponseWriter may re-add a correct Content-Length for
@@ -658,7 +699,10 @@ func TestHealthIncludesForwardProxy(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
@@ -694,7 +738,10 @@ func startProxyOnFreePort(t *testing.T, cfg *config.Config) (string, func()) {
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
 	m := metrics.New()
-	p := New(cfg, logger, sc, m)
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1022,13 +1069,16 @@ func TestSSRFSafeDialContext_DirectIP(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// Direct IP in internal range should be blocked
-	_, err := p.ssrfSafeDialContext(ctx, "tcp", "10.0.0.1:443")
+	_, err = p.ssrfSafeDialContext(ctx, "tcp", "10.0.0.1:443")
 	if err == nil {
 		t.Fatal("expected SSRF block for internal IP, got nil")
 	}
@@ -1043,13 +1093,16 @@ func TestSSRFSafeDialContext_InvalidAddr(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// Address without port should fail SplitHostPort
-	_, err := p.ssrfSafeDialContext(ctx, "tcp", "no-port")
+	_, err = p.ssrfSafeDialContext(ctx, "tcp", "no-port")
 	if err == nil {
 		t.Fatal("expected error for address without port")
 	}
@@ -1061,13 +1114,16 @@ func TestSSRFSafeDialContext_LoopbackBlocked(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// 127.0.0.1 is in the internal range 127.0.0.0/8.
-	_, err := p.ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:443")
+	_, err = p.ssrfSafeDialContext(ctx, "tcp", "127.0.0.1:443")
 	if err == nil {
 		t.Fatal("expected SSRF block for loopback IP")
 	}
@@ -1082,7 +1138,10 @@ func TestSSRFSafeDialContext_DNSResolvesToInternal(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1091,7 +1150,7 @@ func TestSSRFSafeDialContext_DNSResolvesToInternal(t *testing.T) {
 	// machines. This exercises the DNS LookupHost + IP validation path in
 	// ssrfSafeDialContext (lines 194-215), which is not covered by direct-IP
 	// tests.
-	_, err := p.ssrfSafeDialContext(ctx, "tcp", "localhost:443")
+	_, err = p.ssrfSafeDialContext(ctx, "tcp", "localhost:443")
 	if err == nil {
 		t.Fatal("expected SSRF block for localhost resolving to 127.0.0.1")
 	}
@@ -1121,7 +1180,10 @@ func TestSSRFSafeDialContext_AllowedIP(t *testing.T) {
 
 	logger := audit.NewNop()
 	sc := scanner.New(cfg)
-	p := New(cfg, logger, sc, metrics.New())
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
